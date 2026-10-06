@@ -18,7 +18,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Nim
+      - name: Cache choosenim (unix)
+        if: runner.os != 'Windows'
+        uses: actions/cache@v4
+        with:
+          path: ~/.choosenim
+          key: ${{ runner.os }}-choosenim-${{ matrix.nim-version }}
+
+      - name: Setup Nim (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          if [ ! -x "$HOME/.nimble/bin/choosenim" ]; then
+            curl https://nim-lang.org/choosenim/init.sh -sSf | sh -s -- -y
+          fi
+          export PATH="$HOME/.nimble/bin:$PATH"
+          choosenim -y "${{ matrix.nim-version }}"
+          echo "$HOME/.nimble/bin" >> "$GITHUB_PATH"
+          nim -v
+
+      - name: Setup Nim (windows)
+        if: runner.os == 'Windows'
         uses: jiro4989/setup-nim-action@v2
         with:
           nim-version: ${{ matrix.nim-version }}
