@@ -2,16 +2,20 @@ import std/[net, asyncdispatch, os]
 import std/httpclient except Proxy
 import types, server
 
-type
-  AdapterParams = object
-    bindAddr: string
-    upstreamStr: string
+const
+  maxBindAddr = 256
+  maxUpstream = 1024
 
+type
   AdapterContext = object
     ready: bool
     running: bool
     port: Port
-    params: AdapterParams
+    bindAddrLen: int
+    bindAddrBuf: array[maxBindAddr, char]
+    upstreamLen: int
+    upstreamBuf: array[maxUpstream, char]
+    thread: Thread[ptr AdapterContext]
 
   LocalAdapter* = ref object
     port*: Port
@@ -20,7 +24,6 @@ type
     isThreaded*: bool
     server*: ProxyServer
     ctx: ptr AdapterContext
-    thread: Thread[ptr AdapterContext]
 
 proc httpUrl*(a: LocalAdapter): string =
   "http://" & a.bindAddr & ":" & $a.port.int
@@ -38,7 +41,7 @@ proc stop*(a: LocalAdapter) =
   if a.isThreaded:
     if not a.ctx.isNil:
       a.ctx.running = false
-      joinThread(a.thread)
+      joinThread(a.ctx.thread)
       deallocShared(a.ctx)
       a.ctx = nil
   else:
@@ -46,8 +49,14 @@ proc stop*(a: LocalAdapter) =
       a.server.stop()
 
 proc adapterWorker(ctx: ptr AdapterContext) {.thread.} =
-  let upstream = if ctx.params.upstreamStr.len > 0: parseProxy(ctx.params.upstreamStr) else: nil
-  let srv = newServer(ctx.port, ctx.params.bindAddr, kind = skAuto, upstream = upstream)
+  var bindAddr = newString(ctx.bindAddrLen)
+  if ctx.bindAddrLen > 0:
+    copyMem(bindAddr[0].addr, ctx.bindAddrBuf[0].addr, ctx.bindAddrLen)
+  var ustr = newString(ctx.upstreamLen)
+  if ctx.upstreamLen > 0:
+    copyMem(ustr[0].addr, ctx.upstreamBuf[0].addr, ctx.upstreamLen)
+  let upstream = if ustr.len > 0: parseProxy(ustr) else: nil
+  let srv = newServer(ctx.port, bindAddr, kind = skAuto, upstream = upstream)
   asyncCheck srv.start()
   while not srv.running:
     poll(2)
@@ -66,16 +75,21 @@ proc adapterWorker(ctx: ptr AdapterContext) {.thread.} =
     discard
 
 proc startAdapter*(upstream: Proxy, bindAddr = "127.0.0.1"): LocalAdapter =
+  let ustr = if upstream.isNil: "" else: $upstream
+  if bindAddr.len > maxBindAddr or ustr.len > maxUpstream:
+    raise newException(ProxyProtocolError, "adapter address too long")
   let ctx = createShared(AdapterContext)
   ctx.ready = false
   ctx.running = true
   ctx.port = Port(0)
-  ctx.params = AdapterParams(
-    bindAddr: bindAddr,
-    upstreamStr: if upstream.isNil: "" else: $upstream
-  )
-  var thr: Thread[ptr AdapterContext]
-  createThread(thr, adapterWorker, ctx)
+  ctx.bindAddrLen = bindAddr.len
+  if bindAddr.len > 0:
+    copyMem(ctx.bindAddrBuf[0].addr, bindAddr[0].unsafeAddr, bindAddr.len)
+  ctx.upstreamLen = ustr.len
+  if ustr.len > 0:
+    copyMem(ctx.upstreamBuf[0].addr, ustr[0].unsafeAddr, ustr.len)
+  # thread handle lives in shared memory and is never moved
+  createThread(ctx.thread, adapterWorker, ctx)
   while not ctx.ready:
     os.sleep(2)
 
@@ -84,8 +98,7 @@ proc startAdapter*(upstream: Proxy, bindAddr = "127.0.0.1"): LocalAdapter =
     bindAddr: bindAddr,
     upstream: upstream,
     isThreaded: true,
-    ctx: ctx,
-    thread: thr
+    ctx: ctx
   )
 
 proc startAdapterAsync*(upstream: Proxy, bindAddr = "127.0.0.1"): Future[LocalAdapter] {.async.} =
