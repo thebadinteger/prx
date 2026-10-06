@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        nim-version: ['stable']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Nim
+        uses: alaviss/setup-nim@v1
+        with:
+          path: nim
+          version: ${{ matrix.nim-version }}
+
+      - name: Run tests
+        run: nim r -p:. tests/test.nim
+
+      - name: Run tests with SSL
+        run: nim r -p:. -d:ssl tests/test.nim
+
+      - name: Check Examples
+        run: |
+          nim check -p:. examples/httpclient/main.nim
+          nim check -p:. examples/server/main.nim
+          nim check -p:. examples/checker/main.nim
+          nim check -p:. examples/chain/main.nim
+          nim check -p:. examples/udp/main.nim
+          nim check -p:. examples/bridge/main.nim
+          nim check -p:. examples/rawsocket/main.nim
