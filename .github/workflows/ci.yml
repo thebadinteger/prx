@@ -18,15 +18,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Cache choosenim (unix)
-        if: runner.os != 'Windows'
+      - name: Cache choosenim (linux)
+        if: runner.os == 'Linux'
         uses: actions/cache@v4
         with:
           path: ~/.choosenim
           key: ${{ runner.os }}-choosenim-${{ matrix.nim-version }}
 
-      - name: Setup Nim (unix)
-        if: runner.os != 'Windows'
+      - name: Setup Nim (linux)
+        if: runner.os == 'Linux'
         shell: bash
         run: |
           if [ ! -x "$HOME/.nimble/bin/choosenim" ]; then
@@ -36,6 +36,40 @@ jobs:
           choosenim -y "${{ matrix.nim-version }}"
           echo "$HOME/.nimble/bin" >> "$GITHUB_PATH"
           nim -v
+
+      - name: Resolve Nim version (macos)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          if [ "${{ matrix.nim-version }}" = "stable" ]; then
+            echo "NIM_VER=$(curl -sSL https://nim-lang.org/channels/stable)" >> "$GITHUB_ENV"
+          else
+            echo "NIM_VER=${{ matrix.nim-version }}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Cache Nim (macos)
+        if: runner.os == 'macOS'
+        uses: actions/cache@v4
+        with:
+          path: ~/nim-dist
+          key: ${{ runner.os }}-nim-${{ env.NIM_VER }}
+
+      - name: Setup Nim (macos)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          if [ ! -x "$HOME/nim-dist/bin/nim" ]; then
+            case "$(uname -m)" in
+              arm64) SUFFIX="macosx_arm64" ;;
+              *) SUFFIX="macosx_x64" ;;
+            esac
+            mkdir -p "$HOME/nim-dist"
+            curl -sSL "https://nim-lang.org/download/nim-${NIM_VER}-${SUFFIX}.tar.xz" -o /tmp/nim-mac.tar.xz
+            tar -xf /tmp/nim-mac.tar.xz -C "$HOME/nim-dist" --strip-components=1
+            rm -f /tmp/nim-mac.tar.xz
+          fi
+          echo "$HOME/nim-dist/bin" >> "$GITHUB_PATH"
+          "$HOME/nim-dist/bin/nim" -v
 
       - name: Setup Nim (windows)
         if: runner.os == 'Windows'
