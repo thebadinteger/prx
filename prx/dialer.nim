@@ -18,47 +18,81 @@ when defined(ssl):
       defaultContext = newContext()
     defaultContext
 
+  const hostCheckUnavailable =
+    "cannot verify the certificate host, openssl 1.0.2 or libressl 2.7 or newer is required"
+
   when defined(nimDisableCertificateValidation):
-    proc expectHost(ssl: SslPtr, host: string) =
+    proc expectHost(ssl: SslPtr, host: string): bool =
+      true
+
+    proc checkHostAfterHandshake(sock: Socket, host: string) =
       discard
   else:
-    # mirrors how std/openssl binds symbols that are missing from old libraries
     when compileOption("dynlibOverride", "ssl") or defined(noOpenSSLHacks):
-      proc SSL_set1_host(ssl: SslPtr, hostname: cstring): cint {.cdecl, dynlib: DLLSSLName, importc.}
+      proc SSL_get0_param(ssl: SslPtr): pointer {.cdecl, dynlib: DLLSSLName, importc.}
+      proc X509_VERIFY_PARAM_set1_host(param: pointer, name: cstring, namelen: csize_t): cint {.
+        cdecl, dynlib: DLLUtilName, importc.}
+
+      proc setVerifyHost(ssl: SslPtr, hostname: cstring): cint =
+        X509_VERIFY_PARAM_set1_host(SSL_get0_param(ssl), hostname, 0)
     else:
+      # mirrors how std/openssl binds symbols that may be missing from a library
       import std/dynlib
 
-      type SetHostProc = proc(ssl: SslPtr, hostname: cstring): cint {.cdecl, gcsafe, raises: [].}
+      type
+        GetParamProc = proc(ssl: SslPtr): pointer {.cdecl, gcsafe, raises: [].}
+        SetHostProc = proc(param: pointer, name: cstring, namelen: csize_t): cint {.
+          cdecl, gcsafe, raises: [].}
 
-      proc SSL_set1_host(ssl: SslPtr, hostname: cstring): cint =
+      proc setVerifyHost(ssl: SslPtr, hostname: cstring): cint =
+        var getParam {.global.}: GetParamProc
         var setHost {.global.}: SetHostProc
-        if setHost.isNil:
-          let lib = loadLibPattern(DLLSSLName)
-          if not lib.isNil:
-            setHost = cast[SetHostProc](lib.symAddr("SSL_set1_host"))
-        if setHost.isNil: 0 else: setHost(ssl, hostname)
+        if getParam.isNil or setHost.isNil:
+          let sslLib = loadLibPattern(DLLSSLName)
+          let cryptoLib = loadLibPattern(DLLUtilName)
+          if not sslLib.isNil:
+            getParam = cast[GetParamProc](sslLib.symAddr("SSL_get0_param"))
+          if not cryptoLib.isNil:
+            setHost = cast[SetHostProc](cryptoLib.symAddr("X509_VERIFY_PARAM_set1_host"))
+        if getParam.isNil or setHost.isNil: 0 else: setHost(getParam(ssl), hostname, 0)
 
-    proc expectHost(ssl: SslPtr, host: string) =
-      ## Makes openssl match the certificate against host during the handshake
-      if not isIpAddress(host) and SSL_set1_host(ssl, host.cstring) != 1:
-        raiseSSLError("cannot verify the certificate host, openssl 1.1.0 or newer is required")
+    proc expectHost(ssl: SslPtr, host: string): bool =
+      ## makes the tls library match the certificate against host during the handshake
+      ## false means the library is too old to be told the host
+      isIpAddress(host) or setVerifyHost(ssl, host.cstring) == 1
+
+    proc checkHostAfterHandshake(sock: Socket, host: string) =
+      ## the check std/net does on its own sockets, for libraries without verify parameters
+      when defined(windows):
+        raiseSSLError(hostCheckUnavailable)
+      else:
+        let certificate = SSL_get_peer_certificate(sock.sslHandle)
+        if certificate.isNil:
+          raiseSSLError("no certificate to match against host " & host)
+        const alwaysCheckSubject = 0x1.cuint
+        let match = X509_check_host(certificate, host.cstring, host.len.cint, alwaysCheckSubject, nil)
+        X509_free(certificate)
+        if match != 1:
+          raiseSSLError("certificate does not match host " & host)
 
 proc wrapTls(sock: Socket, host: string, sslContext: SslContext) =
   when defined(ssl):
     tlsContext(sslContext).wrapSocket(sock)
     if not isIpAddress(host):
       discard SSL_set_tlsext_host_name(sock.sslHandle, host)
-    expectHost(sock.sslHandle, host)
+    let hostChecked = expectHost(sock.sslHandle, host)
     ErrClearError()
     socketError(sock, SSL_connect(sock.sslHandle))
+    if not hostChecked:
+      checkHostAfterHandshake(sock, host)
   else:
     raise newException(ProxyProtocolError, "tls to " & host & " requires compiling with -d:ssl")
 
 proc wrapTls(sock: AsyncSocket, host: string, sslContext: SslContext) =
   when defined(ssl):
-    # the handshake itself runs on the first read or write
     tlsContext(sslContext).wrapConnectedSocket(sock, handshakeAsClient, host)
-    expectHost(sock.sslHandle, host)
+    if not expectHost(sock.sslHandle, host):
+      raiseSSLError(hostCheckUnavailable)
   else:
     raise newException(ProxyProtocolError, "tls to " & host & " requires compiling with -d:ssl")
 

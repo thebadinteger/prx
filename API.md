@@ -140,7 +140,7 @@ Connects through a proxy or a chain and establishes an end-to-end TLS session wi
 ### TLS
 TLS to a `pkHttps` proxy and to a `dialTls` target requires compilation with `-d:ssl`; without it these calls raise `ProxyProtocolError` before connecting
 
-- The certificate chain and its host name are verified for both sync and async sockets on every platform (OpenSSL 1.1.0 or newer). IP address hosts get chain verification only. `-d:nimDisableCertificateValidation` turns verification off
+- The certificate chain and its host name are verified for both sync and async sockets on every platform. This needs OpenSSL 1.0.2 or newer, or LibreSSL 2.7 or newer such as the one macOS ships; with an older library sync dials still verify the host name and async dials are refused. IP address hosts get chain verification only. `-d:nimDisableCertificateValidation` turns verification off
 - By default one `newContext()` per thread is shared by all dials. Pass `sslContext` for a private CA, client certificates or other settings; the host name check still applies while the context verifies peers
 ```nim
 let ctx = newContext(caFile = "corporate-ca.pem")
