@@ -219,7 +219,7 @@ prx/
 ## Limitations
 - DNS lookups use the blocking system resolver, as `std/asyncnet` does; with remote DNS the proxy resolves instead
 - A connection carries one TLS session: at most one `https://` proxy per chain, and `dialTls` cannot run behind an `https://` proxy
-- `dialTlsAsync` returns before the TLS handshake, which runs on the first read or write
+- Sync dials do not time out a TLS handshake that stalls; async dials do
 - The server refuses UDP ASSOCIATE when an upstream proxy is set
 - Fragmented SOCKS5 UDP datagrams are dropped
 

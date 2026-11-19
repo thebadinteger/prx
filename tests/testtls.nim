@@ -110,20 +110,42 @@ when defined(ssl) and not defined(nimDisableCertificateValidation):
       proc run() {.async.} =
         let sock = await dialTlsAsync(p, "localhost", Port(443), sslContext = trusted)
         check (await echoAsync(sock)) == "re:ping"
-        # the async handshake runs on first use, so the mismatch shows up there
-        let bad = await dialTlsAsync(p, "wrong.example", Port(443), sslContext = trusted)
-        checkRaises CatchableError:
-          discard await echoAsync(bad)
-        bad.close()
+        checkRaises ProxyConnectError:
+          discard await dialTlsAsync(p, "wrong.example", Port(443), sslContext = trusted)
 
       waitFor run()
       finish(m)
 
     test "untrusted certificates are rejected by default":
-      let m = startMock(mmTlsTarget, 1)
+      let m = startMock(mmTlsTarget, 2)
+      let p = proxyFor(m, "socks5")
       expect ProxyConnectError:
-        discard dialTls(proxyFor(m, "socks5"), "localhost", Port(443))
+        discard dialTls(p, "localhost", Port(443))
+
+      proc run() {.async.} =
+        checkRaises ProxyConnectError:
+          discard await dialTlsAsync(p, "localhost", Port(443))
+
+      waitFor run()
       finish(m)
+
+    test "async tls handshake is bound by the dial timeout":
+      proc run() {.async.} =
+        let listener = listenLocal()
+        asyncCheck serveOnce(listener, proc(c: AsyncSocket) {.async.} =
+          discard await c.recv(3)
+          await c.send("\x05\x00")
+          let head = await c.recv(5)
+          discard await c.recv(head[4].int + 2)
+          await c.send("\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
+          # the tunnel is open but the tls peer never answers
+          while (await c.recv(4096)).len > 0:
+            discard
+        )
+        checkRaises ProxyTimeoutError:
+          discard await dialTlsAsync(proxyFor(listener), "localhost", Port(443), timeout = 300)
+
+      waitFor run()
 
     test "https proxy":
       let m = startMock(mmHttpsProxy, 3)

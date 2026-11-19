@@ -18,14 +18,16 @@ when defined(ssl):
       defaultContext = newContext()
     defaultContext
 
-  const hostCheckUnavailable =
-    "cannot verify the certificate host, openssl 1.0.2 or libressl 2.7 or newer is required"
+  # these exist in every openssl and libressl release
+  proc SSL_get_rbio(ssl: SslPtr): BIO {.cdecl, dynlib: DLLSSLName, importc.}
+  proc SSL_get_wbio(ssl: SslPtr): BIO {.cdecl, dynlib: DLLSSLName, importc.}
+  proc SSL_get_verify_mode(ssl: SslPtr): cint {.cdecl, dynlib: DLLSSLName, importc.}
 
   when defined(nimDisableCertificateValidation):
     proc expectHost(ssl: SslPtr, host: string): bool =
       true
 
-    proc checkHostAfterHandshake(sock: Socket, host: string) =
+    proc checkHostAfterHandshake(ssl: SslPtr, host: string) =
       discard
   else:
     when compileOption("dynlibOverride", "ssl") or defined(noOpenSSLHacks):
@@ -61,19 +63,53 @@ when defined(ssl):
       ## false means the library is too old to be told the host
       isIpAddress(host) or setVerifyHost(ssl, host.cstring) == 1
 
-    proc checkHostAfterHandshake(sock: Socket, host: string) =
+    proc checkHostAfterHandshake(ssl: SslPtr, host: string) =
       ## the check std/net does on its own sockets, for libraries without verify parameters
-      when defined(windows):
-        raiseSSLError(hostCheckUnavailable)
-      else:
-        let certificate = SSL_get_peer_certificate(sock.sslHandle)
-        if certificate.isNil:
-          raiseSSLError("no certificate to match against host " & host)
-        const alwaysCheckSubject = 0x1.cuint
-        let match = X509_check_host(certificate, host.cstring, host.len.cint, alwaysCheckSubject, nil)
-        X509_free(certificate)
-        if match != 1:
-          raiseSSLError("certificate does not match host " & host)
+      if SSL_get_verify_mode(ssl) != 0:
+        when defined(windows):
+          raiseSSLError(
+            "cannot verify the certificate host, openssl 1.0.2 or newer is required")
+        else:
+          let certificate = SSL_get_peer_certificate(ssl)
+          if certificate.isNil:
+            raiseSSLError("no certificate to match against host " & host)
+          const alwaysCheckSubject = 0x1.cuint
+          let match = X509_check_host(certificate, host.cstring, host.len.cint, alwaysCheckSubject, nil)
+          X509_free(certificate)
+          if match != 1:
+            raiseSSLError("certificate does not match host " & host)
+
+  proc handshakeTls(sock: AsyncSocket) {.async.} =
+    let rbio = SSL_get_rbio(sock.sslHandle)
+    let wbio = SSL_get_wbio(sock.sslHandle)
+    var done = false
+    while not done:
+      # a timed out dial closes the socket, which frees the tls state
+      if sock.isClosed:
+        raiseSSLError("socket closed during the tls handshake")
+      ErrClearError()
+      let ret = sslDoHandshake(sock.sslHandle)
+      let err = if ret == 1: SSL_ERROR_NONE.cint else: SSL_get_error(sock.sslHandle, ret)
+      if err notin [SSL_ERROR_NONE.cint, SSL_ERROR_WANT_READ.cint, SSL_ERROR_WANT_WRITE.cint]:
+        raiseSSLError()
+
+      let pending = bioCtrlPending(wbio)
+      if pending > 0:
+        var outgoing = newString(pending)
+        let taken = bioRead(wbio, cast[cstring](addr outgoing[0]), pending)
+        if taken < 0:
+          raiseSSLError()
+        outgoing.setLen(taken)
+        await sock.getFd.AsyncFD.send(outgoing)
+
+      if ret == 1:
+        done = true
+      elif err == SSL_ERROR_WANT_READ:
+        var incoming = await recv(sock.getFd.AsyncFD, 4096)
+        if incoming.len == 0 or sock.isClosed:
+          raiseSSLError("connection closed during the tls handshake")
+        if bioWrite(rbio, cast[cstring](addr incoming[0]), incoming.len.cint) < 0:
+          raiseSSLError()
 
 proc wrapTls(sock: Socket, host: string, sslContext: SslContext) =
   when defined(ssl):
@@ -84,15 +120,17 @@ proc wrapTls(sock: Socket, host: string, sslContext: SslContext) =
     ErrClearError()
     socketError(sock, SSL_connect(sock.sslHandle))
     if not hostChecked:
-      checkHostAfterHandshake(sock, host)
+      checkHostAfterHandshake(sock.sslHandle, host)
   else:
     raise newException(ProxyProtocolError, "tls to " & host & " requires compiling with -d:ssl")
 
-proc wrapTls(sock: AsyncSocket, host: string, sslContext: SslContext) =
+proc wrapTls(sock: AsyncSocket, host: string, sslContext: SslContext): Future[void] {.async.} =
   when defined(ssl):
     tlsContext(sslContext).wrapConnectedSocket(sock, handshakeAsClient, host)
-    if not expectHost(sock.sslHandle, host):
-      raiseSSLError(hostCheckUnavailable)
+    let hostChecked = expectHost(sock.sslHandle, host)
+    await handshakeTls(sock)
+    if not hostChecked:
+      checkHostAfterHandshake(sock.sslHandle, host)
   else:
     raise newException(ProxyProtocolError, "tls to " & host & " requires compiling with -d:ssl")
 
@@ -204,13 +242,13 @@ proc tunnelThrough(
   sslContext: SslContext
 ): Future[void] {.multisync.} =
   if proxies[0].kind == pkHttps:
-    wrapTls(sock, proxies[0].host, sslContext)
+    await wrapTls(sock, proxies[0].host, sslContext)
   for i in 0 .. proxies.high:
     if i < proxies.high:
       let next = proxies[i + 1]
       await performHandshake(sock, proxies[i], next.host, next.port, timeout)
       if next.kind == pkHttps:
-        wrapTls(sock, next.host, sslContext)
+        await wrapTls(sock, next.host, sslContext)
     else:
       await performHandshake(sock, proxies[i], targetHost, targetPort, timeout)
 
@@ -337,9 +375,14 @@ proc dialTlsAsync*(
   sslContext: SslContext = nil
 ): Future[AsyncSocket] {.async.} =
   checkChain(proxies, tlsTarget = true)
+  let t = effectiveTimeout(proxies[0], timeout)
   let sock = await dialAsync(proxies, targetHost, targetPort, timeout)
   try:
-    wrapTls(sock, targetHost, sslContext)
+    let handshake = wrapTls(sock, targetHost, sslContext)
+    if t > 0 and not await withTimeout(handshake, t):
+      raise newException(ProxyTimeoutError,
+        "tls handshake with " & targetHost & " timed out after " & $t & "ms")
+    await handshake
     result = sock
   except CatchableError as e:
     closeQuietly(sock)
