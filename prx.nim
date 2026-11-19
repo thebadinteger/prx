@@ -27,7 +27,7 @@ proc proxy*(
   username = "",
   password = "",
   timeout = 10000,
-  remoteDns = true
+  remoteDns = kind != pkSocks4
 ): Proxy =
   newProxy(host, port, kind, username, password, timeout, remoteDns)
 

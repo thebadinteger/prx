@@ -1,58 +1,60 @@
-import std/[net, asyncnet, asyncdispatch, nativesockets]
-import types, common
+import std/[net, asyncnet, asyncdispatch]
+import types, hostport, wire
 
 proc buildRequest(proxy: Proxy, targetHost: string, targetPort: Port): string =
-  result = newStringOfCap(32)
-  result.add('\x04')
-  result.add('\x01')
-  let p = targetPort.toBytes
-  result.add(p[0].char)
-  result.add(p[1].char)
+  if '\x00' in proxy.username or proxy.username.len > 255:
+    raise newException(ProxyAuthError, "socks4 userid must be at most 255 bytes without nul")
+  let host = stripBrackets(targetHost)
+  var ip: IpAddress
+  let literal = tryParseIp(host, ip)
+  let isV4 = literal and ip.family == IpAddressFamily.IPv4
+  let useDomain = not isV4 and (proxy.remoteDns or proxy.kind == pkSocks4a)
+  if useDomain:
+    checkHost(host)
+  elif literal and not isV4:
+    raise newException(ProxyProtocolError, "socks4 does not support ipv6 target " & host)
+  elif not literal:
+    # resolve host for strict socks4
+    ip = resolveHost(host, allowIpv6 = false)
 
-  if isIpv4(targetHost):
-    let ip = parseIpAddress(targetHost)
-    for b in ip.address_v4:
-      result.add(b.char)
-    result.add(proxy.username)
-    result.add('\x00')
-  elif proxy.remoteDns or proxy.kind == pkSocks4a:
+  result = newStringOfCap(16 + proxy.username.len + host.len)
+  result.add("\x04\x01")
+  result.addPort(targetPort)
+  if useDomain:
     # socks4a fake ip marker
     result.add("\x00\x00\x00\x01")
-    result.add(proxy.username)
-    result.add('\x00')
-    result.add(targetHost)
-    result.add('\x00')
   else:
-    # resolve host for strict socks4
-    let ent = getHostByName(targetHost)
-    if ent.addrList.len == 0:
-      raise newException(ProxyConnectError, "cannot resolve host " & targetHost)
-    let ip = parseIpAddress(ent.addrList[0])
     for b in ip.address_v4:
       result.add(b.char)
-    result.add(proxy.username)
+  result.add(proxy.username)
+  result.add('\x00')
+  if useDomain:
+    result.add(host)
     result.add('\x00')
 
 proc verifyResponse(resp: string) =
-  if resp.len != 8:
-    raise newException(ProxyConnectError, "invalid socks4 response length")
+  if resp.len != 8 or resp[0] != '\x00':
+    raise newException(ProxyProtocolError, "invalid socks4 response")
   let status = resp[1].byte
-  if status == 0x5A:
-    return
   case status
+  of 0x5A: discard
   of 0x5B: raise newException(ProxyConnectError, "socks4 request rejected")
   of 0x5C: raise newException(ProxyConnectError, "socks4 identd failed")
   of 0x5D: raise newException(ProxyConnectError, "socks4 userid error")
   else: raise newException(ProxyConnectError, "socks4 failed with code " & $status)
 
-proc handshake*(sock: Socket, proxy: Proxy, targetHost: string, targetPort: Port, timeout = -1) =
-  let req = buildRequest(proxy, targetHost, targetPort)
-  sock.send(req)
-  let resp = recvExact(sock, 8, timeout)
-  verifyResponse(resp)
+proc connectThrough(
+  sock: Socket | AsyncSocket,
+  proxy: Proxy,
+  targetHost: string,
+  targetPort: Port,
+  timeout: int
+): Future[void] {.multisync.} =
+  await sock.send(buildRequest(proxy, targetHost, targetPort))
+  verifyResponse(await recvN(sock, 8, timeout))
 
-proc handshake*(sock: AsyncSocket, proxy: Proxy, targetHost: string, targetPort: Port): Future[void] {.async.} =
-  let req = buildRequest(proxy, targetHost, targetPort)
-  await sock.send(req)
-  let resp = await recvExact(sock, 8)
-  verifyResponse(resp)
+proc handshake*(sock: Socket, proxy: Proxy, targetHost: string, targetPort: Port, timeout = -1) =
+  connectThrough(sock, proxy, targetHost, targetPort, timeout)
+
+proc handshake*(sock: AsyncSocket, proxy: Proxy, targetHost: string, targetPort: Port): Future[void] =
+  connectThrough(sock, proxy, targetHost, targetPort, -1)

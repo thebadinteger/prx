@@ -1,20 +1,29 @@
-import std/[net, asyncdispatch, os]
+import std/[net, asyncdispatch, os, atomics]
 import std/httpclient except Proxy
-import types, server
+import types, hostport, server
 
 const
   maxBindAddr = 256
-  maxUpstream = 1024
+  maxUpstream = 2048
+  maxError = 256
+
+  stateStarting = 0
+  stateReady = 1
+  stateFailed = 2
 
 type
   AdapterContext = object
-    ready: bool
-    running: bool
+    state: Atomic[int]
+    running: Atomic[bool]
     port: Port
+    upstreamTimeout: int
+    upstreamRemoteDns: bool
     bindAddrLen: int
     bindAddrBuf: array[maxBindAddr, char]
     upstreamLen: int
     upstreamBuf: array[maxUpstream, char]
+    errorLen: int
+    errorBuf: array[maxError, char]
     thread: Thread[ptr AdapterContext]
 
   LocalAdapter* = ref object
@@ -25,11 +34,21 @@ type
     server*: ProxyServer
     ctx: ptr AdapterContext
 
+proc store(buf: var openArray[char], len: var int, value: string) =
+  len = min(value.len, buf.len)
+  if len > 0:
+    copyMem(addr buf[0], addr value[0], len)
+
+proc load(buf: openArray[char], len: int): string =
+  result = newString(len)
+  if len > 0:
+    copyMem(addr result[0], addr buf[0], len)
+
 proc httpUrl*(a: LocalAdapter): string =
-  "http://" & a.bindAddr & ":" & $a.port.int
+  "http://" & joinHostPort(a.bindAddr, a.port)
 
 proc socks5Url*(a: LocalAdapter): string =
-  "socks5://" & a.bindAddr & ":" & $a.port.int
+  "socks5://" & joinHostPort(a.bindAddr, a.port)
 
 proc proxy*(a: LocalAdapter): Proxy =
   newProxy(a.bindAddr, a.port, pkHttp)
@@ -40,7 +59,7 @@ proc socksProxy*(a: LocalAdapter): Proxy =
 proc stop*(a: LocalAdapter) =
   if a.isThreaded:
     if not a.ctx.isNil:
-      a.ctx.running = false
+      a.ctx.running.store(false)
       joinThread(a.ctx.thread)
       deallocShared(a.ctx)
       a.ctx = nil
@@ -49,49 +68,51 @@ proc stop*(a: LocalAdapter) =
       a.server.stop()
 
 proc adapterWorker(ctx: ptr AdapterContext) {.thread.} =
-  var bindAddr = newString(ctx.bindAddrLen)
-  if ctx.bindAddrLen > 0:
-    copyMem(bindAddr[0].addr, ctx.bindAddrBuf[0].addr, ctx.bindAddrLen)
-  var ustr = newString(ctx.upstreamLen)
-  if ctx.upstreamLen > 0:
-    copyMem(ustr[0].addr, ctx.upstreamBuf[0].addr, ctx.upstreamLen)
-  let upstream = if ustr.len > 0: parseProxy(ustr) else: nil
-  let srv = newServer(ctx.port, bindAddr, kind = skAuto, upstream = upstream)
-  asyncCheck srv.start()
-  while not srv.running:
-    poll(2)
+  var srv: ProxyServer
+  try:
+    var upstream: Proxy = nil
+    if ctx.upstreamLen > 0:
+      upstream = parseProxy(load(ctx.upstreamBuf, ctx.upstreamLen), timeout = ctx.upstreamTimeout)
+      upstream.remoteDns = ctx.upstreamRemoteDns
+    srv = newServer(ctx.port, load(ctx.bindAddrBuf, ctx.bindAddrLen), kind = skAuto, upstream = upstream)
+    srv.listen()
+  except CatchableError as e:
+    store(ctx.errorBuf, ctx.errorLen, e.msg)
+    ctx.state.store(stateFailed)
+    return
   ctx.port = srv.port
-  ctx.ready = true
+  ctx.state.store(stateReady)
+  asyncCheck srv.serve()
 
   # run dispatch loop
-  while ctx.running and srv.running:
+  while ctx.running.load and srv.running:
     try:
       poll(20)
     except CatchableError:
       break
-  try:
-    srv.stop()
-  except CatchableError:
-    discard
+  srv.stop()
 
 proc startAdapter*(upstream: Proxy, bindAddr = "127.0.0.1"): LocalAdapter =
   let ustr = if upstream.isNil: "" else: $upstream
   if bindAddr.len > maxBindAddr or ustr.len > maxUpstream:
     raise newException(ProxyProtocolError, "adapter address too long")
   let ctx = createShared(AdapterContext)
-  ctx.ready = false
-  ctx.running = true
-  ctx.port = Port(0)
-  ctx.bindAddrLen = bindAddr.len
-  if bindAddr.len > 0:
-    copyMem(ctx.bindAddrBuf[0].addr, bindAddr[0].unsafeAddr, bindAddr.len)
-  ctx.upstreamLen = ustr.len
-  if ustr.len > 0:
-    copyMem(ctx.upstreamBuf[0].addr, ustr[0].unsafeAddr, ustr.len)
+  ctx.running.store(true)
+  store(ctx.bindAddrBuf, ctx.bindAddrLen, bindAddr)
+  store(ctx.upstreamBuf, ctx.upstreamLen, ustr)
+  if not upstream.isNil:
+    ctx.upstreamTimeout = upstream.timeout
+    ctx.upstreamRemoteDns = upstream.remoteDns
   # thread handle lives in shared memory and is never moved
   createThread(ctx.thread, adapterWorker, ctx)
-  while not ctx.ready:
-    os.sleep(2)
+  while ctx.state.load == stateStarting:
+    os.sleep(1)
+
+  if ctx.state.load == stateFailed:
+    joinThread(ctx.thread)
+    let reason = load(ctx.errorBuf, ctx.errorLen)
+    deallocShared(ctx)
+    raise newException(ProxyConnectError, "cannot start local adapter: " & reason)
 
   LocalAdapter(
     port: ctx.port,
@@ -103,11 +124,10 @@ proc startAdapter*(upstream: Proxy, bindAddr = "127.0.0.1"): LocalAdapter =
 
 proc startAdapterAsync*(upstream: Proxy, bindAddr = "127.0.0.1"): Future[LocalAdapter] {.async.} =
   let srv = newServer(Port(0), bindAddr, kind = skAuto, upstream = upstream)
-  asyncCheck srv.start()
-  while not srv.running:
-    await sleepAsync(2)
+  srv.listen()
+  asyncCheck srv.serve()
 
-  LocalAdapter(
+  result = LocalAdapter(
     port: srv.port,
     bindAddr: bindAddr,
     upstream: upstream,

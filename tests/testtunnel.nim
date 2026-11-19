@@ -75,3 +75,15 @@ suite "prx proxy chaining":
       sock.close()
 
     waitFor runHttpProxy() and runSocks5Proxy() and runClient()
+
+  test "invalid chains are rejected before connecting":
+    let tls1 = parseProxy("https://127.0.0.1:1")
+    let tls2 = parseProxy("https://127.0.0.1:2")
+    expect ProxyConnectError:
+      discard dial(newSeq[Proxy](), "target.local", Port(80))
+    expect ProxyConnectError:
+      discard dial([tls1, nil], "target.local", Port(80))
+    expect ProxyProtocolError:
+      discard dial([tls1, tls2], "target.local", Port(80))
+    expect ProxyProtocolError:
+      discard dialTls(tls1, "target.local", Port(443))

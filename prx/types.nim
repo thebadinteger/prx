@@ -1,4 +1,5 @@
 import std/[net, strutils, uri]
+import hostport
 
 type
   ProxyKind* = enum
@@ -32,7 +33,7 @@ proc newProxy*(
   username = "",
   password = "",
   timeout = 10000,
-  remoteDns = true
+  remoteDns = kind != pkSocks4
 ): Proxy =
   Proxy(
     kind: kind,
@@ -61,78 +62,83 @@ proc parseProxyKind*(scheme: string): ProxyKind =
   else:
     raise newException(ProxyProtocolError, "unknown proxy protocol " & scheme)
 
+proc invalidProxy(reason, raw: string) {.noinline, noreturn.} =
+  raise newException(ProxyProtocolError, reason & " in proxy string " & raw)
+
+proc remoteDnsFor(kind: ProxyKind, fallback: bool): bool =
+  case kind
+  of pkSocks4: false
+  of pkSocks4a: true
+  else: fallback
+
+proc parseProxyUri(raw, clean: string, timeout: int, defaultRemoteDns: bool): Proxy =
+  let u = parseUri(clean)
+  let kind = parseProxyKind(u.scheme)
+  if u.hostname.len == 0:
+    invalidProxy("missing host", raw)
+  var port = case kind
+    of pkSocks4, pkSocks4a, pkSocks5: Port(1080)
+    of pkHttps: Port(443)
+    of pkHttp: Port(8080)
+  if u.port.len > 0 and not parsePort(u.port, port):
+    invalidProxy("invalid port", raw)
+  var rdns = u.scheme.toLowerAscii == "socks5h" or remoteDnsFor(kind, defaultRemoteDns)
+  for key, value in decodeQuery(u.query):
+    if key.toLowerAscii in ["rdns", "remotedns"]:
+      case value.toLowerAscii
+      of "0", "false": rdns = false
+      of "1", "true": rdns = true
+      else: discard
+  newProxy(
+    host = u.hostname,
+    port = port,
+    kind = kind,
+    username = decodeUrl(u.username, decodePlus = false),
+    password = decodeUrl(u.password, decodePlus = false),
+    timeout = timeout,
+    remoteDns = rdns
+  )
+
 proc parseProxy*(raw: string, defaultKind = pkSocks5, timeout = 10000, defaultRemoteDns = true): Proxy =
   let clean = raw.strip()
   if clean.len == 0:
     raise newException(ProxyProtocolError, "empty proxy string")
 
-  # parse uri format
   if "://" in clean:
-    let u = parseUri(clean)
-    let kind = parseProxyKind(u.scheme)
-    let portInt = if u.port.len > 0: parseInt(u.port)
-                  elif kind in {pkSocks4, pkSocks4a, pkSocks5}: 1080
-                  elif kind == pkHttps: 443
-                  else: 8080
-    var rdns = if kind == pkSocks4: false
-               elif u.scheme.toLowerAscii == "socks5h" or kind == pkSocks4a: true
-               else: defaultRemoteDns
-    let q = u.query.toLowerAscii
-    if "rdns=0" in q or "rdns=false" in q or "remotedns=0" in q or "remotedns=false" in q:
-      rdns = false
-    elif "rdns=1" in q or "rdns=true" in q or "remotedns=1" in q or "remotedns=true" in q:
-      rdns = true
-    return newProxy(
-      host = u.hostname,
-      port = Port(portInt),
-      kind = kind,
-      username = u.username,
-      password = u.password,
-      timeout = timeout,
-      remoteDns = rdns
-    )
+    return parseProxyUri(raw, clean, timeout, defaultRemoteDns)
 
-
-  # parse user pass at host port
-  if '@' in clean:
-    let atParts = clean.split('@', 1)
-    let credParts = atParts[0].split(':', 1)
-    let hostParts = atParts[1].split(':', 1)
-    if hostParts.len < 2:
-      raise newException(ProxyProtocolError, "missing port in proxy string " & raw)
-    let username = credParts[0]
-    let password = if credParts.len > 1: credParts[1] else: ""
-    let port = Port(parseInt(hostParts[1]))
-    return newProxy(
-      host = hostParts[0],
-      port = port,
-      kind = defaultKind,
-      username = username,
-      password = password,
-      timeout = timeout
-    )
-
-  # parse host port or host port user pass
-  let parts = clean.split(':')
-  case parts.len
-  of 2:
-    return newProxy(
-      host = parts[0],
-      port = Port(parseInt(parts[1])),
-      kind = defaultKind,
-      timeout = timeout
-    )
-  of 4:
-    return newProxy(
-      host = parts[0],
-      port = Port(parseInt(parts[1])),
-      kind = defaultKind,
-      username = parts[2],
-      password = parts[3],
-      timeout = timeout
-    )
+  var host, username, password = ""
+  var port: Port
+  let at = clean.rfind('@')
+  if at >= 0 and parseEndpoint(clean[at + 1 .. ^1], host, port):
+    # user pass at host port
+    let creds = clean[0 ..< at].split(':', 1)
+    username = creds[0]
+    if creds.len > 1:
+      password = creds[1]
   else:
-    raise newException(ProxyProtocolError, "invalid proxy format " & raw)
+    # host port or host port user pass
+    var rest = ""
+    if not splitHost(clean, host, rest):
+      invalidProxy("invalid format", raw)
+    let fields = rest.split(':', 2)
+    if not parsePort(fields[0], port):
+      invalidProxy("missing or invalid port", raw)
+    if fields.len == 3:
+      username = fields[1]
+      password = fields[2]
+    elif fields.len != 1:
+      invalidProxy("invalid format", raw)
+
+  newProxy(
+    host = host,
+    port = port,
+    kind = defaultKind,
+    username = username,
+    password = password,
+    timeout = timeout,
+    remoteDns = remoteDnsFor(defaultKind, defaultRemoteDns)
+  )
 
 proc `$`*(p: Proxy): string =
   if p.isNil: return "nil"
@@ -144,5 +150,6 @@ proc `$`*(p: Proxy): string =
     of pkHttps: "https"
   var auth = ""
   if p.username.len > 0 or p.password.len > 0:
-    auth = p.username & ":" & p.password & "@"
-  scheme & "://" & auth & p.host & ":" & $p.port.int
+    auth = encodeUrl(p.username, usePlus = false) & ":" &
+      encodeUrl(p.password, usePlus = false) & "@"
+  scheme & "://" & auth & joinHostPort(p.host, p.port)

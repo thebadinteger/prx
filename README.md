@@ -13,6 +13,7 @@
 - [Protocols](#protocols)
 - [Authentication](#authentication)
 - [Architecture](#architecture)
+- [Limitations](#limitations)
 - [Documentation](#documentation)
 - [License](#license)
 
@@ -113,20 +114,23 @@ proc proxy*(raw: string, defaultKind = pkSocks5, timeout = 10000, remoteDns = tr
 proc parseProxy*(raw: string, defaultKind = pkSocks5, timeout = 10000, defaultRemoteDns = true): Proxy
 ```
 Parses URI strings (`socks5://...`, `socks5h://...`, `socks4://...`, `http://...`, `https://...`) or `host:port`, `user:pass@host:port`, and `host:port:user:pass` notations  
-Supports query flags `?rdns=0` and `?rdns=1`
+Supports query flags `?rdns=0` and `?rdns=1`, bracketed IPv6 hosts (`[::1]:1080`) and percent-encoded credentials in URIs  
+SOCKS4 proxies resolve host names locally unless remote DNS is requested; every other kind resolves through the proxy by default
 
 #### `prx.dial` / `prx.dialAsync`
 ```nim
-proc dial*(proxy: Proxy, targetHost: string, targetPort: Port, timeout = -1): Socket
-proc dialAsync*(proxy: Proxy, targetHost: string, targetPort: Port): Future[AsyncSocket]
-proc dial*(proxies: openArray[Proxy], targetHost: string, targetPort: Port, timeout = -1): Socket
-proc dialAsync*(proxies: openArray[Proxy], targetHost: string, targetPort: Port): Future[AsyncSocket]
+proc dial*(proxy: Proxy, targetHost: string, targetPort: Port, timeout = -1, sslContext: SslContext = nil): Socket
+proc dialAsync*(proxy: Proxy, targetHost: string, targetPort: Port, timeout = -1, sslContext: SslContext = nil): Future[AsyncSocket]
+proc dial*(proxies: openArray[Proxy], targetHost: string, targetPort: Port, timeout = -1, sslContext: SslContext = nil): Socket
+proc dialAsync*(proxies: openArray[Proxy], targetHost: string, targetPort: Port, timeout = -1, sslContext: SslContext = nil): Future[AsyncSocket]
 ```
-Establishes a connection to the target host and port through a single proxy or a multi-hop chain of proxies
+Establishes a connection to the target host and port through a single proxy or a multi-hop chain of proxies  
+`timeout` is in milliseconds and falls back to `proxy.timeout`; every failure is raised as a `ProxyError` subtype  
+`sslContext` replaces the default verifying TLS context for an `https://` proxy; `dialTls` / `dialTlsAsync` take the same arguments and add TLS to the target
 
 #### `prx.dialUdp`
 ```nim
-proc dialUdp*(proxy: Proxy): Future[UdpRelay]
+proc dialUdp*(proxy: Proxy, timeout = -1): Future[UdpRelay]
 proc sendTo*(relay: UdpRelay, targetHost: string, targetPort: Port, data: string): Future[void]
 proc recvFrom*(relay: UdpRelay, maxSize = 65535): Future[tuple[host: string, port: Port, data: string]]
 ```
@@ -147,12 +151,15 @@ Caller owns the adapter and must call `adapter.stop()` after `client.close()`
 ```nim
 proc server*(port: Port = Port(1080), bindAddr = "127.0.0.1", kind = skAuto, upstream: Proxy = nil): ProxyServer
 proc start*(server: ProxyServer): Future[void]
+proc listen*(server: ProxyServer)
+proc serve*(server: ProxyServer): Future[void]
 proc stop*(server: ProxyServer)
 proc setAuth*(server: ProxyServer, username, password: string)
 proc setFilter*(server: ProxyServer, handler: FilterHandler)
 proc setLogger*(server: ProxyServer, handler: LogHandler)
 ```
-Configures and launches a multi-protocol proxy server (`skAuto`, `skSocks5`, `skSocks4`, `skHttp`). Can optionally forward upstream to another proxy
+Configures and launches a multi-protocol proxy server (`skAuto`, `skSocks5`, `skSocks4`, `skHttp`). Can optionally forward upstream to another proxy  
+`start` is `listen` followed by `serve`; call them separately to learn the bound port (`Port(0)`) or catch bind errors before serving
 
 #### `prx.pipe` / `prx.startBridge`
 ```nim
@@ -195,6 +202,8 @@ prx/
 - prx/
 -- types.nim    # Proxy, ProxyKind, exceptions, URL parser
 -- common.nim   # Socket helpers, IP validation, datagram reader
+-- hostport.nim # Internal host:port parsing and validation
+-- wire.nim     # Internal SOCKS5 address codec and shared I/O helpers
 -- socks4.nim   # SOCKS4 and SOCKS4a client handshakes
 -- socks5.nim   # SOCKS5 client handshake, auth, IPv4/IPv6/Domain
 -- http.nim     # HTTP CONNECT tunnel client
@@ -206,6 +215,13 @@ prx/
 - examples/     # Practical runnable examples
 - tests/        # Modular test suite
 ```
+
+## Limitations
+- DNS lookups use the blocking system resolver, as `std/asyncnet` does; with remote DNS the proxy resolves instead
+- A connection carries one TLS session: at most one `https://` proxy per chain, and `dialTls` cannot run behind an `https://` proxy
+- `dialTlsAsync` returns before the TLS handshake, which runs on the first read or write
+- The server refuses UDP ASSOCIATE when an upstream proxy is set
+- Fragmented SOCKS5 UDP datagrams are dropped
 
 ## Documentation
 Full API technical reference is available in **[`API.md`](API.md)**

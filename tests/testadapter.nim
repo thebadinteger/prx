@@ -82,3 +82,8 @@ suite "prx adapter":
 
     upAdapter.stop()
     joinThread(thr)
+
+  test "sync adapter reports a bind failure":
+    # 203.0.113.0/24 is reserved for documentation and is never a local address
+    expect ProxyConnectError:
+      discard startAdapter(nil, bindAddr = "203.0.113.1")

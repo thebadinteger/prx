@@ -41,7 +41,7 @@ type
     username*: string       # Authentication username
     password*: string       # Authentication password
     timeout*: int           # Connection timeout in milliseconds (default 10000)
-    remoteDns*: bool        # Toggle remote DNS resolution (default true)
+    remoteDns*: bool        # Toggle remote DNS resolution (default true, false for pkSocks4)
 ```
 
 ### `newProxy`
@@ -54,9 +54,10 @@ proc newProxy*(
   username = "",
   password = "",
   timeout = 10000,
-  remoteDns = true
+  remoteDns = kind != pkSocks4
 ): Proxy
 ```
+`remoteDns` decides who resolves a host name target: the proxy (`true`) or the local resolver (`false`). It defaults to `false` only for `pkSocks4`, which then sends plain SOCKS4 requests with an IPv4 address. Setting it to `true` on a `pkSocks4` proxy sends the SOCKS4a domain extension instead
 
 ### `parseProxy`
 Parses proxy definition from URI or standard string formats:
@@ -75,9 +76,15 @@ proc parseProxy*(
 - `socks4a://1.2.3.4:1080` (`remoteDns = true` by default)
 - `http://1.2.3.4:8080` / `https://1.2.3.4:8443`
 - `1.2.3.4:1080` (uses `defaultKind`)
-- `1.2.3.4:1080:user:pass`
+- `1.2.3.4:1080:user:pass` (the password may contain `:`)
 - `user:pass@1.2.3.4:1080`
+- IPv6 hosts in brackets: `socks5://[::1]:1080`, `[::1]:1080`, `user:pass@[::1]:1080`
 - Query parameters: `?rdns=0`, `?rdns=false`, `?remotedns=0` disable remote DNS resolution
+
+URI credentials are percent-decoded (`socks5://user:p%40ss@host:1080` gives the password `p@ss`), and `$proxy` percent-encodes them so the result parses back to the same proxy  
+Formats without a scheme use `defaultKind`  
+`defaultRemoteDns` applies to `pkSocks5`, `pkHttp` and `pkHttps`; `pkSocks4` always starts with local DNS and `pkSocks4a` with remote DNS, in every format  
+A missing host, a missing port in the scheme-less formats, or a port outside `1..65535` raises `ProxyProtocolError`
 
 ---
 
@@ -87,24 +94,58 @@ Provides synchronous and asynchronous connection establishment, TLS wrapping, an
 
 ### Single Proxy Dial
 ```nim
-proc dial*(proxy: Proxy, targetHost: string, targetPort: Port, timeout = -1): Socket
-proc dialAsync*(proxy: Proxy, targetHost: string, targetPort: Port): Future[AsyncSocket]
+proc dial*(proxy: Proxy, targetHost: string, targetPort: Port,
+           timeout = -1, sslContext: SslContext = nil): Socket
+proc dialAsync*(proxy: Proxy, targetHost: string, targetPort: Port,
+                timeout = -1, sslContext: SslContext = nil): Future[AsyncSocket]
 ```
 Establishes a connection to `targetHost:targetPort` via `proxy`. Sockets are created with `buffered = false` for low latency
 
+`sslContext` is only used for the TLS session with a `pkHttps` proxy, see [TLS](#tls)
+
+`targetHost` is an IPv4 address, an IPv6 address (with or without brackets) or a host name of at most 255 bytes; anything else raises `ProxyProtocolError` before a request is sent
+
+### Timeouts
+`timeout` is in milliseconds. A negative value (the default) uses `proxy.timeout` of the first proxy; an effective value of `0` or less disables the timeout
+- `dialAsync` treats it as one deadline for the TCP connect and every handshake of the chain. When it expires the socket is closed and `ProxyTimeoutError` is raised
+- `dial` applies it to the TCP connect and to each handshake read separately
+
 ### Proxy Chaining
 ```nim
-proc dial*(proxies: openArray[Proxy], targetHost: string, targetPort: Port, timeout = -1): Socket
-proc dialAsync*(proxies: openArray[Proxy], targetHost: string, targetPort: Port): Future[AsyncSocket]
+proc dial*(proxies: openArray[Proxy], targetHost: string, targetPort: Port,
+           timeout = -1, sslContext: SslContext = nil): Socket
+proc dialAsync*(proxies: openArray[Proxy], targetHost: string, targetPort: Port,
+                timeout = -1, sslContext: SslContext = nil): Future[AsyncSocket]
 ```
 Tunnels through multiple proxies in sequence across different protocols (e.g. `[HTTP, SOCKS5, SOCKS4] > Target`)
 
+An empty chain or a `nil` entry raises `ProxyConnectError`. A chain may contain at most one `pkHttps` proxy, at any position, because a socket carries a single TLS session
+
 ### TLS Dialing
 ```nim
-proc dialTls*(proxy: Proxy, targetHost: string, targetPort: Port, timeout = -1): Socket
-proc dialTlsAsync*(proxy: Proxy, targetHost: string, targetPort: Port): Future[AsyncSocket]
+proc dialTls*(proxy: Proxy, targetHost: string, targetPort: Port,
+              timeout = -1, sslContext: SslContext = nil): Socket
+proc dialTlsAsync*(proxy: Proxy, targetHost: string, targetPort: Port,
+                   timeout = -1, sslContext: SslContext = nil): Future[AsyncSocket]
+proc dialTls*(proxies: openArray[Proxy], targetHost: string, targetPort: Port,
+              timeout = -1, sslContext: SslContext = nil): Socket
+proc dialTlsAsync*(proxies: openArray[Proxy], targetHost: string, targetPort: Port,
+                   timeout = -1, sslContext: SslContext = nil): Future[AsyncSocket]
 ```
-Connects through `proxy` and establishes an end-to-end TLS session with `targetHost` (requires compilation with `-d:ssl`)
+Connects through a proxy or a chain and establishes an end-to-end TLS session with `targetHost`
+
+- `dialTls` completes the TLS handshake before returning. `dialTlsAsync` returns once the tunnel is open and the handshake runs on the first read or write, so certificate errors surface there as `SslError`
+- No proxy in the chain may be `pkHttps` (`ProxyProtocolError`), for the same single TLS session reason
+
+### TLS
+TLS to a `pkHttps` proxy and to a `dialTls` target requires compilation with `-d:ssl`; without it these calls raise `ProxyProtocolError` before connecting
+
+- The certificate chain and its host name are verified for both sync and async sockets on every platform (OpenSSL 1.1.0 or newer). IP address hosts get chain verification only. `-d:nimDisableCertificateValidation` turns verification off
+- By default one `newContext()` per thread is shared by all dials. Pass `sslContext` for a private CA, client certificates or other settings; the host name check still applies while the context verifies peers
+```nim
+let ctx = newContext(caFile = "corporate-ca.pem")
+let sock = dialTls(p, "internal.example", Port(443), sslContext = ctx)
+```
 
 ---
 
@@ -125,9 +166,12 @@ type
 
 ### `dialUdp`
 ```nim
-proc dialUdp*(proxy: Proxy): Future[UdpRelay]
+proc dialUdp*(proxy: Proxy, timeout = -1): Future[UdpRelay]
+proc close*(relay: UdpRelay)
 ```
 Negotiates authentication and SOCKS5 UDP Associate command with `proxy` over a TCP control socket, initializes a local UDP socket, and returns an active `UdpRelay`
+
+`timeout` works like in `dialAsync`. When the proxy reports an unspecified relay address (`0.0.0.0`), the address of the control connection is used. The association ends when the control connection closes, so keep the relay open and `close` it when done
 
 ### `sendTo`
 ```nim
@@ -141,6 +185,8 @@ Encapsulates `data` into an RFC 1928 SOCKS5 UDP request packet and transmits it 
 proc recvFrom*(relay: UdpRelay, maxSize = 65535): Future[tuple[host: string, port: Port, data: string]]
 ```
 Receives an encapsulated UDP response packet from the proxy and decodes source address, port, and payload
+
+Datagrams that do not come from the relay address and fragmented datagrams are skipped. A malformed packet from the relay raises `ProxyProtocolError`
 
 ### `startUdpBridge`
 ```nim
@@ -181,8 +227,9 @@ type
     running*: bool
     activeConnections*: int
     totalConnections*: int
-    totalBytesSent*: int64
-    totalBytesRecv*: int64
+    totalBytesSent*: int64      # client to target
+    totalBytesRecv*: int64      # target to client
+    handshakeTimeout*: int      # ms a client may take to send its request (default 30000, 0 disables)
 ```
 
 ### Procedures
@@ -190,12 +237,30 @@ type
 proc newServer*(port: Port = Port(1080), bindAddr = "127.0.0.1", kind = skAuto, upstream: Proxy = nil): ProxyServer
 proc server*(port: Port = Port(1080), bindAddr = "127.0.0.1", kind = skAuto, upstream: Proxy = nil): ProxyServer
 proc start*(server: ProxyServer): Future[void]
+proc listen*(server: ProxyServer)
+proc serve*(server: ProxyServer): Future[void]
 proc stop*(server: ProxyServer)
 proc setAuth*(server: ProxyServer, username, password: string)
 proc setAuth*(server: ProxyServer, handler: proc(u, p: string): bool {.closure, gcsafe.})
 proc setFilter*(server: ProxyServer, handler: proc(host: string, port: Port): bool {.closure, gcsafe.})
 proc setLogger*(server: ProxyServer, handler: proc(msg: string) {.closure, gcsafe.})
 ```
+
+`listen` binds the socket and raises on failure; with `Port(0)` it stores the chosen port in `server.port`. `serve` accepts clients until `stop`. `start` runs both
+```nim
+let srv = server(Port(0))
+srv.listen()
+echo "listening on ", srv.port.int
+waitFor srv.serve()
+```
+
+### Behavior
+- **Relaying** is half-close aware: when one side finishes sending, the other side sees end of stream and can still reply. Both sockets are closed once both directions are done or either one fails
+- **Plain HTTP requests** are forwarded with `Connection: close`, one request per client connection, without the `Proxy-*` headers. Malformed requests get `400`, oversized headers `431`
+- **SOCKS5 replies** carry the local address of the outbound connection on success and distinguish refused (`0x05`) and unreachable-network (`0x03`) targets; other dial failures are host unreachable (`0x04`)
+- **UDP Associate** binds the relay on the address the client connected to, accepts datagrams only from that client's IP and pins the first source port it uses. Malformed and fragmented datagrams are dropped. IPv4, IPv6 and host name destinations are relayed. The command is refused (`0x07`) when `upstream` is set, since datagrams would bypass the upstream proxy
+- **SOCKS4** has no passwords: with `setAuth` the handler is called with the user id and an empty password
+- **Limits**: request lines and headers up to 8192 bytes each, 128 headers, 255 bytes for SOCKS4 user ids and host names
 
 ---
 
@@ -220,6 +285,8 @@ proc startAdapterAsync*(upstream: Proxy, bindAddr = "127.0.0.1"): Future[LocalAd
 proc stop*(a: LocalAdapter)
 ```
 Starts a lightweight local combo server. For synchronous code, `startAdapter` runs in an isolated background thread using shared memory
+
+Both raise when the local server cannot be bound (`startAdapter` as `ProxyConnectError`)
 
 ### Helper Properties
 ```nim
@@ -273,8 +340,10 @@ ProxyError (CatchableError)
 - ProxyAuthError       # Authentication credentials rejected or unsupported
 - ProxyConnectError    # Target unreachable, connection refused, or tunnel failed
 - ProxyTimeoutError    # Operation timed out
-- ProxyProtocolError   # Invalid packet format, malformed handshake, or missing TLS
+- ProxyProtocolError   # Invalid packet format, malformed handshake, invalid proxy string or target, or missing TLS
 ```
+`dial`, `dialAsync`, `dialTls`, `dialTlsAsync` and `dialUdp` raise only `ProxyError` subtypes: socket and TLS failures are wrapped in `ProxyConnectError` and timeouts in `ProxyTimeoutError`, with the original exception kept as `parent`
+
 All errors inherit from `ProxyError` (and `CatchableError`), allowing global catching:
 ```nim
 try:

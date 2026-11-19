@@ -10,3 +10,4 @@ nimcache/
 *.o
 tests/test
 tests/test.exe
+.agents/

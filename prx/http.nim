@@ -1,8 +1,13 @@
 import std/[net, asyncnet, asyncdispatch, strutils, base64]
-import types
+import types, hostport, wire
+
+const
+  maxHeaderLine = 8192
+  maxHeaderCount = 128
 
 proc buildConnectRequest*(proxy: Proxy, targetHost: string, targetPort: Port): string =
-  let target = targetHost & ":" & $targetPort.int
+  checkHost(stripBrackets(targetHost))
+  let target = joinHostPort(targetHost, targetPort)
   result = "CONNECT " & target & " HTTP/1.1\r\n"
   result.add("Host: " & target & "\r\n")
   result.add("Proxy-Connection: Keep-Alive\r\n")
@@ -16,7 +21,7 @@ proc buildConnectRequest*(proxy: Proxy, targetHost: string, targetPort: Port): s
 
 proc parseStatusCode(statusLine: string): int =
   let parts = statusLine.strip.split(' ', 2)
-  if parts.len < 2:
+  if parts.len < 2 or not parts[0].startsWith("HTTP/"):
     raise newException(ProxyProtocolError, "invalid http response " & statusLine)
   try:
     parseInt(parts[1])
@@ -29,38 +34,37 @@ proc checkStatus(code: int, statusLine: string) =
   if code < 200 or code >= 300:
     raise newException(ProxyConnectError, "http tunnel failed with " & statusLine)
 
+proc connectThrough(
+  sock: Socket | AsyncSocket,
+  proxy: Proxy,
+  targetHost: string,
+  targetPort: Port,
+  timeout: int
+): Future[void] {.multisync.} =
+  await sock.send(buildConnectRequest(proxy, targetHost, targetPort))
+
+  let statusLine = await recvLineN(sock, maxHeaderLine, timeout)
+  if statusLine.strip.len == 0:
+    raise newException(ProxyConnectError, "empty response from http proxy")
+
+  let code = parseStatusCode(statusLine)
+
+  # drain response headers
+  var count = 0
+  while true:
+    let line = await recvLineN(sock, maxHeaderLine, timeout)
+    if line.len == 0:
+      raise newException(ProxyConnectError, "http proxy closed the connection mid response")
+    if line == "\r\n":
+      break
+    inc count
+    if count > maxHeaderCount or line.len >= maxHeaderLine:
+      raise newException(ProxyProtocolError, "http proxy response headers too large")
+
+  checkStatus(code, statusLine)
+
 proc handshake*(sock: Socket, proxy: Proxy, targetHost: string, targetPort: Port, timeout = -1) =
-  let req = buildConnectRequest(proxy, targetHost, targetPort)
-  sock.send(req)
+  connectThrough(sock, proxy, targetHost, targetPort, timeout)
 
-  let statusLine = sock.recvLine(timeout)
-  if statusLine.strip.len == 0:
-    raise newException(ProxyConnectError, "empty response from http proxy")
-
-  let code = parseStatusCode(statusLine)
-
-  # drain response headers
-  while true:
-    let line = sock.recvLine(timeout)
-    if line.strip.len == 0:
-      break
-
-  checkStatus(code, statusLine)
-
-proc handshake*(sock: AsyncSocket, proxy: Proxy, targetHost: string, targetPort: Port): Future[void] {.async.} =
-  let req = buildConnectRequest(proxy, targetHost, targetPort)
-  await sock.send(req)
-
-  let statusLine = await sock.recvLine
-  if statusLine.strip.len == 0:
-    raise newException(ProxyConnectError, "empty response from http proxy")
-
-  let code = parseStatusCode(statusLine)
-
-  # drain response headers
-  while true:
-    let line = await sock.recvLine
-    if line.strip.len == 0:
-      break
-
-  checkStatus(code, statusLine)
+proc handshake*(sock: AsyncSocket, proxy: Proxy, targetHost: string, targetPort: Port): Future[void] =
+  connectThrough(sock, proxy, targetHost, targetPort, -1)
