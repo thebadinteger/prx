@@ -1,4 +1,4 @@
-version       = "0.1.0"
+version       = "0.2.0"
 author        = "badinteger"
 description   = "universal proxy client and server library for Nim"
 license       = "MIT"
